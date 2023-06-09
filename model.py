@@ -25,7 +25,7 @@
 import copy 
 import numpy as np
 import sys
-import parcel_from_srf_zdep
+import plume_model
 #import ribtol
 
 def esat(T):
@@ -384,7 +384,7 @@ class model:
         else:
             lowest_gammaq = self.gammaq
 
-            # calculate free-tropospheric profile extrapolated to surface 
+        # calculate free-tropospheric profile extrapolated to surface 
         self.theta_ft0 = self.theta + self.dtheta - lowest_gammatheta * self.h     
 
         self.q_ft0 = self.q + self.dq - lowest_gammaq * self.h 
@@ -582,15 +582,15 @@ class model:
 
         # calculate cloud core fraction (ac), mass flux (M) and moisture flux (wqM)
         if self.q2_h > 0:  # prevent invalid values when surface flux is negative
-            if True: # use the parametrization of Neggers et al. (2006), as used in Van Stratum (2014)
+            if self.input.sw_acc_sikma: # use the parametrization of Neggers et al. (2006), as used in Van Stratum (2014)
                 self.acc    = max(0., 0.5 + 0.36 * np.arctan(1.55 * ((self.q - qsat(self.T_h, self.P_h)) / self.q2_h**0.5))) 
-            if False: # use the parametrization of Sikma and Ouwersloot (2015) (experimental!) 
+            else: # use the parametrization of Sikma and Ouwersloot (2015) (experimental!) 
                 z = np.linspace(0, 2e3)
                 self.lfc = self.h + self.dz_h   # not accurate before cumulus initialization! needs to be improved
                 
                 # calculate free-tropospheric theta, q, and pressure at the LFC, can be improved by accounting for moistening by forced convection.
-                theta_prof = parcel_from_srf_zdep.calc_input_prof(z, self.theta_ft0, self.input.h, self.input.heightdep['gammatheta'][0], self.input.heightdep['gammatheta'][1], self.input.theta)
-                q_prof = parcel_from_srf_zdep.calc_input_prof(z, self.q_ft0, self.input.h, self.input.heightdep['gammaq'][0], self.input.heightdep['gammaq'][1], self.input.q)
+                theta_prof = plume_model.calc_input_prof(z, self.theta_ft0, self.input.h, self.input.heightdep['gammatheta'][0], self.input.heightdep['gammatheta'][1], self.input.theta)
+                q_prof = plume_model.calc_input_prof(z, self.q_ft0, self.input.h, self.input.heightdep['gammaq'][0], self.input.heightdep['gammaq'][1], self.input.q)
                 theta_lfc = np.interp(self.lfc, z, theta_prof) + self.Stheta / self.hstore
                 q_lfc = np.interp(self.lfc, z, q_prof) + self.Sq / self.hstore
                 pres_lfc, exner_lfc = calc_pres(self.Ps, self.P_ref, self.theta, self.q, self.gammatheta, self.gammaq, self.lfc, self.h)  # ps -rho*g*z is not good enough here
@@ -604,7 +604,7 @@ class model:
 
        
         if (self.sw_plume and self.acc > 0):
-            self.w_lfc = parcel_from_srf_zdep.main(self)  # run plume model to calculate vert. velocity at lfc
+            self.w_lfc = plume_model.main(self)  # run plume model to calculate vert. velocity at lfc
         else:
             self.w_lfc = 0
             
