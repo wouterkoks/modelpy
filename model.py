@@ -22,9 +22,10 @@
 # along with CLASS.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-import copy as cp
+import copy 
 import numpy as np
 import sys
+import parcel_from_srf_zdep
 #import ribtol
 
 def esat(T):
@@ -33,10 +34,24 @@ def esat(T):
 def qsat(T,p):
     return 0.622 * esat(T) / p
 
+def calc_pres(Ps, Pref, T0, q0, gth, gq, z, h):
+    """"Specify hydrostatic pressure profile above mixed-layer based on a constant gradient of virtual potential temp. above mixed-layer"""
+    tv_const = 0.61
+    g = 9.81
+    Rd = 287
+    cp = 1005
+    Tv0 = T0 * (1 + tv_const * q0)
+    gtv0 = (1 + tv_const * q0) * - g / cp
+    ph  = Ps * (1 + gtv0 * h / Tv0) ** ( - g / (Rd * gtv0))
+    gtv = (1 + tv_const * q0) * (gth - g / cp) + tv_const * T0 * gq
+    pres = ph * (1 + gtv * (z-h) / Tv0) ** ( - g / (Rd * gtv))
+    exner = (pres / Pref) ** (Rd / cp)
+    return pres, exner
+
 class model:
     def __init__(self, model_input):
         # initialize the different components of the model
-        self.input = cp.deepcopy(model_input)
+        self.input = copy.deepcopy(model_input)
 
     def run(self):
         # initialize model variables
@@ -104,7 +119,12 @@ class model:
         self.ls_type    = self.input.ls_type    # land surface paramaterization (js or ags)
         self.sw_cu      = self.input.sw_cu      # cumulus parameterization switch
 
+        self.sw_plume       = self.input.sw_plume    # entraining plume diagnostics switch
+        self.sw_cin         = self.input.sw_cin      # CIN inhibition switch
+        self.sw_store       = self.input.sw_store    # Tropospheric storage switch    
+        
         # initialize mixed-layer
+        self.P_ref      = self.input.P_ref 
         self.h          = self.input.h          # initial ABL height [m]
         self.Ps         = self.input.Ps         # surface pressure [Pa]
         self.divU       = self.input.divU       # horizontal large-scale divergence of wind [s-1]
@@ -114,15 +134,15 @@ class model:
         self.we         = -1.                   # entrainment velocity [m s-1]
 
          # Temperature
-        self.theta      = self.input.theta      # initial mixed-layer potential temperature [K]
-        self.dtheta     = self.input.dtheta     # initial temperature jump at h [K]
-        self.gammatheta = self.input.gammatheta # free atmosphere potential temperature lapse rate [K m-1]
-        self.advtheta   = self.input.advtheta   # advection of heat [K s-1]
-        self.beta       = self.input.beta       # entrainment ratio for virtual heat [-]
-        self.wtheta     = self.input.wtheta     # surface kinematic heat flux [K m s-1]
-        self.wthetae    = None                  # entrainment kinematic heat flux [K m s-1]
-
-        self.wstar      = 0.                    # convective velocity scale [m s-1]
+        self.theta            = self.input.theta      # initial mixed-layer potential temperature [K]
+        self.dtheta           = self.input.dtheta     # initial temperature jump at h [K]
+        self.gammatheta       = self.input.gammatheta # free atmosphere potential temperature lapse rate [K m-1]
+        self.advtheta_ml      = self.input.advtheta_ml   # advection of heat to mixed-layer [K s-1]
+        self.advtheta_ft      = self.input.advtheta_ft   # advection of heat to free-troposphere [K s-1]
+        self.beta             = self.input.beta       # entrainment ratio for virtual heat [-]
+        self.wtheta           = self.input.wtheta     # surface kinematic heat flux [K m s-1]
+        self.wthetae          = None                  # entrainment kinematic heat flux [K m s-1]
+        self.wstar            = 0.                    # convective velocity scale [m s-1]
 
         # 2m diagnostic variables
         self.T2m        = None                  # 2m temperature [K]
@@ -139,8 +159,9 @@ class model:
 
         # Mixed-layer top variables
         self.P_h        = None                  # Mixed-layer top pressure [pa]
+        self.exner_h    = None                  # Mixed-layer top Exner function [-]
         self.T_h        = None                  # Mixed-layer top absolute temperature [K]
-        self.q2_h       = None                  # Mixed-layer top specific humidity variance [kg2 kg-2]
+        self.q2_h       = None                     # Mixed-layer top specific humidity variance [kg2 kg-2]
         self.CO22_h     = None                  # Mixed-layer top CO2 variance [ppm2]
         self.RH_h       = None                  # Mixed-layer top relavtive humidity [-]
         self.dz_h       = None                  # Transition layer thickness [-]
@@ -156,17 +177,21 @@ class model:
         self.q          = self.input.q          # initial mixed-layer specific humidity [kg kg-1]
         self.dq         = self.input.dq         # initial specific humidity jump at h [kg kg-1]
         self.gammaq     = self.input.gammaq     # free atmosphere specific humidity lapse rate [kg kg-1 m-1]
-        self.advq       = self.input.advq       # advection of moisture [kg kg-1 s-1]
+        self.advq_ml    = self.input.advq_ml    # advection of moisture [kg kg-1 s-1]
+        self.advq_ft    = self.input.advq_ft    # advection of moisture [kg kg-1 s-1]
         self.wq         = self.input.wq         # surface kinematic moisture flux [kg kg-1 m s-1]
         self.wqe        = None                  # entrainment moisture flux [kg kg-1 m s-1]
         self.wqM        = None                  # moisture cumulus mass flux [kg kg-1 m s-1]
+        self.phi_cu     = self.input.phi_cu         # scaling parameter of wqM [-]
 
+        
         self.qsat       = None                  # mixed-layer saturated specific humidity [kg kg-1]
         self.esat       = None                  # mixed-layer saturated vapor pressure [Pa]
         self.e          = None                  # mixed-layer vapor pressure [Pa]
         self.qsatsurf   = None                  # surface saturated specific humidity [g kg-1]
         self.dqsatdT    = None                  # slope saturated specific humidity curve [g kg-1 K-1]
-
+        self.qsat_h     = None # saturated specific humidity at mixed-layer top [kg kg-1]
+        
         # CO2
         fac = self.mair / (self.rho*self.mco2)  # Conversion factor mgC m-2 s-1 to ppm m s-1
         self.CO2        = self.input.CO2        # initial mixed-layer CO2 [ppm]
@@ -286,10 +311,20 @@ class model:
         # initialize cumulus parameterization
         self.sw_cu      = self.input.sw_cu      # Cumulus parameterization switch
         self.dz_h       = self.input.dz_h       # Transition layer thickness [m]
-        self.ac         = 0.                    # Cloud core fraction [-]
+        self.acc        = 0.                    # Cloud core fraction [-]
         self.M          = 0.                    # Cloud core mass flux [m s-1]
         self.wqM        = 0.                    # Cloud core moisture flux [kg kg-1 m s-1]
-
+        self.wcld_prefact = self.input.wcld_prefact  # scaling parameter of cloud core velocity with Deardorff velocity scale
+        
+        # initialize plume data
+        self.w_lfc      = 0                     # Plume ertical velocity at the LFC [m s-1]
+        self.cin        = np.nan                # Convective inhibition (up to maximum plume height!) [m2 s-2]
+        self.lfc        = 3e3
+        # initialize tropospheric storage
+        self.hstore     = self.input.hstore # thickness of storage layer in free-troposphere [m]
+        self.Stheta     = 0.     # Amount of free-troposperic heat storage [K m]
+        self.Sq         = 0.                 # Amount of free-tropospheric specific humidity storage [kg kg-1 m]
+        
         # Time or height dependent properties (currently both time and height dependency is not supported
         self.timedep    = self.input.timedep    # Time dependent variables
         self.heightdep  = self.input.heightdep  # Height dependent variables
@@ -298,12 +333,61 @@ class model:
         self.tsteps = int(np.floor(self.input.runtime / self.input.dt))
         self.dt     = self.input.dt
         self.t      = 0
-
+        
+        
+        self.sw_rhtend    = self.input.sw_rhtend   # Switch to diagnose relative humidity tendencies due to different factors
+        self.RHtend_wqs   = None # relative humidity tendency due to ground specific humidity flux
+        self.RHtend_wqe   = None # relative humidity tendency due to entrainment specific humidity flux
+        self.RHtend_wqM   = None # relative humidity tendency due to cumulus specific humidity flux
+        self.RHtend_wth   = None # relative humidity tendency due to ground sensible heat flux
+        self.RHtend_wthe  = None # relative humidity tendency due to entrainment sensible heat flux
+        self.RHtend_we    = None # relative humidity tendency due to entrainment mixed-layer growth
+        self.RHtend_ws    = None # relative humidity tendency due to subsidence
+        self.RHtend_wf    = None # relative humidity tendency due to radiative divergence
+        self.RHtend_M     = None # relative humidity tendency due to mixed-layer height decrease resulting from cumulus massflux
+        self.RHtend_advth = None # relative humidity tendency due to advection
+        self.RHtend_advq  = None # relative humidity tendency due to advection
+        self.RHtend_net   = None # net relative humidity tendency
+        
         # Some sanity checks for valid input
         if (self.c_beta is None):
             self.c_beta = 0                     # Zero curvature; linear response
         assert(self.c_beta >= 0 or self.c_beta <= 1)
+        
+        # check input of timedep variable
+        if self.timedep is not None:
+            for name, var_tuple in self.timedep.items():
+                # check if `name` is a class variable which we can update:
+                if hasattr(self, name):
+                    max_time = self.dt * self.tsteps 
+                    times = var_tuple[0]
+                    values = var_tuple[1]
+                    if times.size != values.size:
+                        raise IndexError("Time dependent variable {} must be of same size as time bins.".format(name))
+                    if max_time > times[-1]:
+                        raise IndexError('Time bins of variable {} do not cover range of simulated times.'.format(name))
+                else:
+                    raise AttributeError('Variable {} in timedep does not exist in model.'.format(name))
+        
 
+        # find lapse rate in the lowest part of the free-troposphere for extrapolation of profiles to surface (phi_ft0)
+        if "gammatheta" in self.heightdep:
+            lowest_gammatheta = self.heightdep['gammatheta'][1][0]
+            if self.h > self.heightdep['gammatheta'][0][1]:
+                raise ValueError("Initial boundary layer higher than lowest change in gammatheta, currently not accomodated")
+        else:
+            lowest_gammatheta = self.gammatheta
+        if "gammaq" in self.heightdep:
+            lowest_gammaq = self.heightdep['gammaq'][1][0]
+            if self.h > self.heightdep['gammaq'][0][1]:
+                raise ValueError("Initial boundary layer higher than lowest change in gammaq, currently not accomodated")
+        else:
+            lowest_gammaq = self.gammaq
+
+            # calculate free-tropospheric profile extrapolated to surface 
+        self.theta_ft0 = self.theta + self.dtheta - lowest_gammatheta * self.h     
+
+        self.q_ft0 = self.q + self.dq - lowest_gammaq * self.h 
         # initialize output
         self.out = model_output(self.tsteps)
 
@@ -323,18 +407,19 @@ class model:
 
         if(self.sw_ls):
             self.run_land_surface()
-
-        if(self.sw_cu):
-            self.run_mixed_layer()
-            self.run_cumulus()
-
-        if(self.sw_ml):
-            self.run_mixed_layer()
+        for i in range(5):
+            if(self.sw_cu):
+                self.run_mixed_layer()
+                # run plume calculations
+                self.run_cumulus()
+    
+            if(self.sw_ml):
+                self.run_mixed_layer()
 
     def timestep(self):
         # Update height or time dependent variables
         self.update_time_height_dependence()
-
+        
         # Calculate some derived properties
         self.statistics()
 
@@ -349,8 +434,9 @@ class model:
         # run land surface model
         if(self.sw_ls):
             self.run_land_surface()
+            
 
-        # run cumulus parameterization
+        # run cumulus parameterization (taking into account CIN if sw_cin == true)
         if(self.sw_cu):
             self.run_cumulus()
 
@@ -368,17 +454,21 @@ class model:
         # time integrate mixed-layer model
         if(self.sw_ml):
             self.integrate_mixed_layer()
+            
+        if(self.sw_rhtend):
+            self.diag_rhtend()
 
     def update_time_height_dependence(self):
 
-        # Update time varying variables
+        # Update time dependent variables
         if self.timedep is not None:
-            time = self.t*self.dt
+            time = self.t * self.dt 
             for name, var_tupple in self.timedep.items():
                 # check if `name` is a class variable which we can update:
                 if hasattr(self, name):
                     # Extract arrays with times and values from input, and interpolate:
                     times   = var_tupple[0]
+                    
                     values  = var_tupple[1]
                     new_val = np.interp(time, times, values)
 
@@ -387,7 +477,7 @@ class model:
                 else:
                     print('Can not update time dependent variable {}!'.format(name))
 
-        # Update height varying variables
+        # Update height dependent variables
         if self.heightdep is not None:
             for name, var_tupple in self.heightdep.items():
                 # check if `name` is a class variable which we can update:
@@ -395,11 +485,16 @@ class model:
                     # Extract arrays with heights and values from input, and interpolate (binned):
                     heights = var_tupple[0]
                     values  = var_tupple[1]
-                    index   = np.abs(heights - self.h).argmin()
-                    if heights[index] > self.h:
-                        index -= 1
-                    new_val = values[index]
+                    
+                    # check input
+                    if values.size != heights.size - 1:
+                        raise IndexError("Height dependent variable {} size must be 1 lower than size of height bins.".format(name))
+                    if self.h > heights[-1]:
+                        raise IndexError('Height bins of variable {} do not cover range of simulated mixed-layer heights'.format(name))
 
+                    index = np.searchsorted(heights, self.h, side='right') - 1
+                    new_val = values[index]
+                    
                     # Update class variable
                     setattr(self, name, new_val)
                 else:
@@ -410,16 +505,14 @@ class model:
         # Calculate virtual temperatures
         self.thetav   = self.theta  + 0.61 * self.theta * self.q
         self.wthetav  = self.wtheta + 0.61 * self.theta * self.wq
-        self.dthetav  = (self.theta + self.dtheta) * (1. + 0.61 * (self.q + self.dq)) - self.theta * (1. + 0.61 * self.q)
-
+        self.dthetav  = (self.theta + self.dtheta) * (1. + 0.61 * (self.q + self.dq)) - self.thetav
+        assert (self.dthetav > 0), "dthetav is negative! t={}".format(self.t)
         # Mixed-layer top properties
-        self.P_h    = self.Ps - self.rho * self.g * self.h
-        self.T_h    = self.theta - self.g/self.cp * self.h
+        self.P_h     = self.Ps - self.rho * self.g * self.h
+        self.exner_h = (self.P_h / self.P_ref) ** (self.Rd / self.cp)
+        self.T_h     = self.exner_h * self.theta 
 
-        #self.P_h    = self.Ps / np.exp((self.g * self.h)/(self.Rd * self.theta))
-        #self.T_h    = self.theta / (self.Ps / self.P_h)**(self.Rd/self.cp)
-
-        self.RH_h   = self.q / qsat(self.T_h, self.P_h)
+        self.RH_h    = self.q / qsat(self.T_h, self.P_h)
 
         # Find lifting condensation level iteratively
         if(self.t == 0):
@@ -433,34 +526,108 @@ class model:
         while(((RHlcl <= 0.9999) or (RHlcl >= 1.0001)) and it<itmax):
             self.lcl    += (1.-RHlcl)*1000.
             p_lcl        = self.Ps - self.rho * self.g * self.lcl
-            T_lcl        = self.theta - self.g/self.cp * self.lcl
+            exner_lcl    = (p_lcl / self.P_ref) ** (self.Rd / self.cp)
+            T_lcl        = exner_lcl * self.theta 
+            
             RHlcl        = self.q / qsat(T_lcl, p_lcl)
             it          += 1
 
         if(it == itmax):
             print("LCL calculation not converged!!")
             print("RHlcl = %f, zlcl=%f"%(RHlcl, self.lcl))
+            
+            
+    def diag_rhtend(self):
+        # Diagnose factors in RH_h budget equation
+        esat_h = esat(self.T_h)
+        self.qsat_h = qsat(self.T_h, self.P_h)
+        desatdT = esat_h * self.Lv / (self.Rv * self.T_h ** 2)
+        c0 = 1 / (self.h * self.qsat_h)  # Moisture pre-factor
+        
+        # if T = theta - g * z/ cp, use:
+        # dTdz = - self.g / self.cp
+        # dTdtheta = 1
+
+        # if T = theta * exner, use:
+        dexnerdz = (self.Rd / self.cp) * self.exner_h * - self.rho * self.g / self.P_h
+        dTdz = self.theta * dexnerdz 
+        dTdtheta = self.exner_h
+
+        c1 = -self.RH_h * desatdT * dTdtheta / (self.h * esat_h)    # Temperature pre-factor   
+        c2 = -self.RH_h * (self.rho * self.g / self.P_h + desatdT / esat_h * dTdz) # mixed-layer growth pre-factor 
+        
+        self.RHtend_wqs   =   c0 * self.wq  # RH tendency due to surface specific humidity flux
+        self.RHtend_wqe   = - c0 * self.wqe # RH tendency due to specific humidity entrainment flux
+        self.RHtend_wqM   = - c0 * self.wqM  # tendency due to specific humidity mass-flux
+        self.RHtend_wth   =   c1 * self.wtheta  # RH tendency due to surface sensible heat flux
+        self.RHtend_wthe  = - c1 * self.wthetae # RH tendency due to sensible heat entrainment flux
+        self.RHtend_we    =   c2 * self.we  # RH tendency due to mixed-layer entrainment growth
+        self.RHtend_ws    =   c2 * self.ws  # RH tendency due to large-scale subsidence
+        self.RHtend_wf    =   c2 * self.wf  # RH tendency due to cloud top radiative divergence
+        self.RHtend_M     = - c2 * self.M # RH tendency due to mass-flux associated mixed-layer height decrease
+        self.RHtend_advth =   c1 * self.advtheta_ml  * self.h  # RH tendency due to temperature advection
+        self.RHtend_advq  =   c0 * self.advq_ml * self.h # RH tendency due to specific humidity advection
+
+        self.RHtend_net = self.RHtend_wqs   + self.RHtend_wqe  + self.RHtend_wqM + self.RHtend_wth + self.RHtend_wthe + \
+                self.RHtend_we + self.RHtend_ws + self.RHtend_wf + self.RHtend_M +self.RHtend_advth + self.RHtend_advq        
 
     def run_cumulus(self):
         # Calculate mixed-layer top relative humidity variance (Neggers et. al 2006/7)
         if(self.wthetav > 0):
-            self.q2_h   = -(self.wqe  + self.wqM  ) * self.dq   * self.h / (self.dz_h * self.wstar)
+            self.q2_h   = -(self.wqe  + self.wqM) * self.dq * self.h / (self.dz_h * self.wstar)
             self.CO22_h = -(self.wCO2e+ self.wCO2M) * self.dCO2 * self.h / (self.dz_h * self.wstar)
         else:
-            self.q2_h   = 0.
-            self.CO22_h = 0.
+            self.q2_h   = 0
+            self.CO22_h = 0
 
         # calculate cloud core fraction (ac), mass flux (M) and moisture flux (wqM)
-        self.ac     = max(0., 0.5 + (0.36 * np.arctan(1.55 * ((self.q - qsat(self.T_h, self.P_h)) / self.q2_h**0.5))))
-        self.M      = self.ac * self.wstar
-        self.wqM    = self.M * self.q2_h**0.5
+        if self.q2_h > 0:  # prevent invalid values when surface flux is negative
+            if True: # use the parametrization of Neggers et al. (2006), as used in Van Stratum (2014)
+                self.acc    = max(0., 0.5 + 0.36 * np.arctan(1.55 * ((self.q - qsat(self.T_h, self.P_h)) / self.q2_h**0.5))) 
+            if False: # use the parametrization of Sikma and Ouwersloot (2015) (experimental!) 
+                z = np.linspace(0, 2e3)
+                self.lfc = self.h + self.dz_h   # not accurate before cumulus initialization! needs to be improved
+                
+                # calculate free-tropospheric theta, q, and pressure at the LFC, can be improved by accounting for moistening by forced convection.
+                theta_prof = parcel_from_srf_zdep.calc_input_prof(z, self.theta_ft0, self.input.h, self.input.heightdep['gammatheta'][0], self.input.heightdep['gammatheta'][1], self.input.theta)
+                q_prof = parcel_from_srf_zdep.calc_input_prof(z, self.q_ft0, self.input.h, self.input.heightdep['gammaq'][0], self.input.heightdep['gammaq'][1], self.input.q)
+                theta_lfc = np.interp(self.lfc, z, theta_prof) + self.Stheta / self.hstore
+                q_lfc = np.interp(self.lfc, z, q_prof) + self.Sq / self.hstore
+                pres_lfc, exner_lfc = calc_pres(self.Ps, self.P_ref, self.theta, self.q, self.gammatheta, self.gammaq, self.lfc, self.h)  # ps -rho*g*z is not good enough here
+                
+                Q2 = (q_lfc - qsat(theta_lfc * exner_lfc, pres_lfc)) / np.sqrt(self.q2_h) # saturation deficit (negative!) [-]
+                self.acc = 0.292* Q2**-2
+                if self.acc > 0.2:  #! artificial limit since acc can currently cause instability when Q2 becomes close to zero. 
+                    self.acc = 0.2  
+        else:
+            self.acc = 0  # negative q flux at mixed-layer top --> q2_h=0 --> no cloud core
 
+       
+        if (self.sw_plume and self.acc > 0):
+            self.w_lfc = parcel_from_srf_zdep.main(self)  # run plume model to calculate vert. velocity at lfc
+        else:
+            self.w_lfc = 0
+            
+        if self.sw_cin: # turn on convective inhibition feedback mechanism on mass-flux
+            self.M     = self.acc * (self.w_lfc - self.ws)
+            if self.M > self.wthetav / self.dthetav and self.M > 0:  # impose upper limit to M
+                self.M = self.wthetav / self.dthetav
+        else:
+            self.M      = self.wcld_prefact * self.acc * (self.wstar - self.ws)
+
+        self.wqM    = self.phi_cu * self.M * self.q2_h**0.5
+        
         # Only calculate CO2 mass-flux if mixed-layer top jump is negative
         if(self.dCO2 < 0):
             self.wCO2M  = self.M * self.CO22_h**0.5
         else:
             self.wCO2M  = 0.
-
+                
+        # alter free-tropospheric profiles
+        self.q_ft0     += self.advq_ft * self.dt  
+        self.theta_ft0 += self.advtheta_ft * self.dt
+        
+        
     def run_mixed_layer(self):
         if(not self.sw_sl):
             # decompose ustar along the wind components
@@ -470,7 +637,7 @@ class model:
         # calculate large-scale vertical velocity (subsidence)
         self.ws = -self.divU * self.h
 
-        # calculate compensation to fix the free troposphere in case of subsidence
+        # calculate compensation to fix the free-troposphere in case of subsidence
         if(self.sw_fixft):
             w_th_ft  = self.gammatheta * self.ws
             w_q_ft   = self.gammaq     * self.ws
@@ -507,14 +674,24 @@ class model:
         self.wqe         = -self.we * self.dq
         self.wCO2e       = -self.we * self.dCO2
 
+
+        # Calculate tendencies
+        if self.sw_store and self.M > 0:  # tendency of tropospheric storage
+                self.Sthetatend = -self.M * self.dtheta - (self.we - self.M) * self.Stheta / self.hstore
+                self.Sqtend = self.M * (self.phi_cu * self.q2_h**0.5 - self.dq) - (self.we - self.M) * self.Sq / self.hstore
+        else:
+            self.Sthetatend = 0
+            self.Sqtend = 0
+        
         self.htend       = self.we + self.ws + self.wf - self.M
 
-        self.thetatend   = (self.wtheta - self.wthetae             ) / self.h + self.advtheta
-        self.qtend       = (self.wq     - self.wqe     - self.wqM  ) / self.h + self.advq
+        self.thetatend   = (self.wtheta - self.wthetae        ) / self.h + self.advtheta_ml 
+        self.qtend       = (self.wq     - self.wqe     - self.wqM) / self.h + self.advq_ml
         self.CO2tend     = (self.wCO2   - self.wCO2e   - self.wCO2M) / self.h + self.advCO2
 
-        self.dthetatend  = self.gammatheta * (self.we + self.wf - self.M) - self.thetatend + w_th_ft
-        self.dqtend      = self.gammaq     * (self.we + self.wf - self.M) - self.qtend     + w_q_ft
+        self.dthetatend  = self.gammatheta * (self.we + self.wf - self.M) + self.Sthetatend / self.hstore - self.thetatend + self.advtheta_ft + w_th_ft 
+        
+        self.dqtend      = self.gammaq     * (self.we + self.wf - self.M) + self.Sqtend / self.hstore - self.qtend + self.advq_ft   + w_q_ft
         self.dCO2tend    = self.gammaCO2   * (self.we + self.wf - self.M) - self.CO2tend   + w_CO2_ft
 
         # assume u + du = ug, so ug - u = du
@@ -526,7 +703,7 @@ class model:
             self.dvtend      = self.gammav * (self.we + self.wf - self.M) - self.vtend
 
         # tendency of the transition layer thickness
-        if(self.ac > 0 or self.lcl - self.h < 300):
+        if(self.acc > 0 or self.lcl - self.h < 300):
             tau = self.h/self.wstar
             self.dztend = ((self.lcl - self.h)-self.dz_h) / tau #7200.
         else:
@@ -559,7 +736,8 @@ class model:
         self.CO2      = CO20    + self.dt * self.CO2tend
         self.dCO2     = dCO20   + self.dt * self.dCO2tend
         self.dz_h     = dz0     + self.dt * self.dztend
-
+        self.Stheta  += self.dt * self.Sthetatend
+        self.Sq      += self.dt * self.Sqtend
         # Limit dz to minimal value
         dz0 = 50
         if(self.dz_h < dz0):
@@ -590,7 +768,7 @@ class model:
     def run_surface_layer(self):
         ueff           = max(0.01, np.sqrt(self.u**2. + self.v**2. + self.wstar**2.))
         self.thetasurf = self.theta + self.wtheta / (self.Cs * ueff)
-        qsatsurf       = qsat(self.thetasurf, self.Ps)
+        qsatsurf       = qsat(self.thetasurf, self.Ps)   # should have a P_ref!!
         cq             = (1. + self.Cs * ueff * self.rs) ** -1.
         self.qsurf     = (1. - cq) * self.q + cq * qsatsurf
 
@@ -934,11 +1112,32 @@ class model:
 
         self.out.zlcl[t]       = self.lcl
         self.out.RH_h[t]       = self.RH_h
+        self.out.we[t]         = self.we
 
-        self.out.ac[t]         = self.ac
+        self.out.acc[t]        = self.acc
         self.out.M[t]          = self.M
         self.out.dz[t]         = self.dz_h
+        self.out.w_lfc[t]      = self.w_lfc
+        self.out.q2_h[t]       = self.q2_h
 
+ 
+        self.out.Stheta[t]     = self.Stheta
+        self.out.Sq[t]         = self.Sq
+        
+        self.out.qsat_h[t]  = self.qsat_h       
+        self.out.RHtend_wqs[t] = self.RHtend_wqs   
+        self.out.RHtend_wqe[t]  = self.RHtend_wqe  
+        self.out.RHtend_wqM[t]  = self.RHtend_wqM    
+        self.out.RHtend_wth[t] = self.RHtend_wth   
+        self.out.RHtend_wthe[t] = self.RHtend_wthe
+        self.out.RHtend_we[t]  = self.RHtend_we  
+        self.out.RHtend_ws[t]   = self.RHtend_ws
+        self.out.RHtend_wf[t] =  self.RHtend_wf  
+        self.out.RHtend_M[t]    = self.RHtend_M   
+        self.out.RHtend_advth[t] = self.RHtend_advth 
+        self.out.RHtend_advq[t] = self.RHtend_advq 
+        self.out.RHtend_net[t]   = self.RHtend_net 
+        
     # delete class variables to facilitate analysis in ipython
     def exitmodel(self):
         del(self.Lv)
@@ -965,7 +1164,8 @@ class model:
         del(self.theta)
         del(self.dtheta)
         del(self.gammatheta)
-        del(self.advtheta)
+        del(self.advtheta_ml)
+        del(self.advtheta_ft)
         del(self.beta)
         del(self.wtheta)
 
@@ -991,7 +1191,8 @@ class model:
         del(self.esat)
         del(self.dq)
         del(self.gammaq)
-        del(self.advq)
+        del(self.advq_ml)
+        del(self.advq_ft)
         del(self.wq)
 
         del(self.u)
@@ -1111,7 +1312,7 @@ class model_output:
         self.wq         = np.zeros(tsteps)    # surface kinematic moisture flux [kg kg-1 m s-1]
         self.wqe        = np.zeros(tsteps)    # entrainment kinematic moisture flux [kg kg-1 m s-1]
         self.wqM        = np.zeros(tsteps)    # cumulus mass-flux kinematic moisture flux [kg kg-1 m s-1]
-
+        
         self.qsat       = np.zeros(tsteps)    # mixed-layer saturated specific humidity [kg kg-1]
         self.e          = np.zeros(tsteps)    # mixed-layer vapor pressure [Pa]
         self.esat       = np.zeros(tsteps)    # mixed-layer saturated vapor pressure [Pa]
@@ -1174,12 +1375,35 @@ class model_output:
         # Mixed-layer top variables
         self.zlcl       = np.zeros(tsteps)    # lifting condensation level [m]
         self.RH_h       = np.zeros(tsteps)    # mixed-layer top relative humidity [-]
+        self.we         = np.zeros(tsteps)
 
         # cumulus variables
-        self.ac         = np.zeros(tsteps)    # cloud core fraction [-]
+        self.acc        = np.zeros(tsteps)    # cloud core fraction [-]
         self.M          = np.zeros(tsteps)    # cloud core mass flux [m s-1]
         self.dz         = np.zeros(tsteps)    # transition layer thickness [m]
-
+        self.w_lfc      = np.zeros(tsteps)
+        self.q2_h       = np.zeros(tsteps)
+        
+        # tropospheric storage variables
+        self.Stheta     = np.zeros(tsteps)
+        self.Sq         = np.zeros(tsteps)
+        
+        self.zlcl         = np.zeros(tsteps)  # lifting condensation level [m]
+        self.RH_h         = np.zeros(tsteps)  # mixed-layer top relative humidity [-]
+        self.qsat_h       = np.zeros(tsteps)  # saturated specific humidity at mixed-layer top [kg kg-1]
+        self.RHtend_wqs   = np.zeros(tsteps)  # relative humidity tendency due to ground specific humidity flux
+        self.RHtend_wqe   = np.zeros(tsteps)  # relative humidity tendency due to entrainment specific humidity flux
+        self.RHtend_wqM   = np.zeros(tsteps)  # relative humidity tendency due to cumulus specific humidity flux
+        self.RHtend_wth   = np.zeros(tsteps)  # relative humidity tendency due to ground sensible heat flux
+        self.RHtend_wthe  = np.zeros(tsteps)  # relative humidity tendency due to entrainment sensible heat flux
+        self.RHtend_we    = np.zeros(tsteps)  # relative humidity tendency due to entrainment mixed-layer growth
+        self.RHtend_ws    = np.zeros(tsteps)  # relative humidity tendency due to subsidence
+        self.RHtend_wf    = np.zeros(tsteps)  # relative humidity tendency due to radiative divergence
+        self.RHtend_M     = np.zeros(tsteps)  # relative humidity tendency due to mixed-layer height decrease resulting from cumulus massflux
+        self.RHtend_advth = np.zeros(tsteps)  # relative humidity tendency due to advection
+        self.RHtend_advq  = np.zeros(tsteps)  # relative humidity tendency due to advection
+        self.RHtend_net   = np.zeros(tsteps)  # net relative humidity tendency
+        
 # class for storing mixed-layer model input data
 class model_input:
     def __init__(self):
@@ -1199,7 +1423,8 @@ class model_input:
         self.theta      = None  # initial mixed-layer potential temperature [K]
         self.dtheta     = None  # initial temperature jump at h [K]
         self.gammatheta = None  # free atmosphere potential temperature lapse rate [K m-1]
-        self.advtheta   = None  # advection of heat [K s-1]
+        self.advtheta_ml = None  # advection of heat to mixed-layer only [K s-1]
+        self.advtheta_ft   = None  # advection of heat to free-troposphere [K s-1]
         self.beta       = None  # entrainment ratio for virtual heat [-]
         self.wtheta     = None  # surface kinematic heat flux [K m s-1]
 
